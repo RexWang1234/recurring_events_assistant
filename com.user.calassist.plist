@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.calassist</string>
+
+    <!-- Start on login and restart automatically if it exits -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3</string>
+        <string>/Users/ruibinwang/calendar_assistant/main.py</string>
+        <string>run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ruibinwang/calendar_assistant</string>
+
+    <!-- Load .env automatically by passing it as environment variables -->
+    <!-- After setup, run: launchctl setenv TELEGRAM_BOT_TOKEN "..." etc. -->
+    <!-- Or use EnvironmentVariables if you prefer to hardcode them here -->
+
+    <key>StandardOutPath</key>
+    <string>/Users/ruibinwang/calendar_assistant/logs/agent.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/ruibinwang/calendar_assistant/logs/agent_error.log</string>
+</dict>
+</plist>

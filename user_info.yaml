@@ -1,0 +1,8 @@
+# Personal information used by the booking agent to fill in appointment forms.
+# Fill in your actual details before running the booking agent.
+
+first_name: "John"
+last_name: "Doe"
+email: "you@gmail.com"
+phone: "555-123-4567"
+notes: ""   # Any notes to leave for the service provider

@@ -1,0 +1,19 @@
+# Calendar Assistant Configuration
+# Copy .env.example to .env and fill in your credentials.
+
+events:
+  - name: Haircut
+    calendar_event_name: "Haircut"        # keyword to search in Apple Calendar
+    frequency_weeks: 4
+    alert_days_before: 7                  # alert if no booking within this many days of due date
+    booking_url: "https://example-salon.com/book"
+    booking_preferences: "Saturday morning, any stylist"
+    calendar_search_keywords: ["haircut", "hair", "salon"]
+
+  - name: Massage
+    calendar_event_name: "Massage"
+    frequency_weeks: 2
+    alert_days_before: 7
+    booking_url: "https://example-massage.com/book"
+    booking_preferences: "Weekday afternoon, 60 min deep tissue"
+    calendar_search_keywords: ["massage", "deep tissue"]
