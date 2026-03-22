@@ -3,7 +3,24 @@
     "allow": [
       "Bash(ls /Users/ruibinwang/calendar_assistant/.env*)",
       "Bash(pip3 install:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(osascript:*)",
+      "Bash(pip3 show:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(playwright install:*)",
+      "WebSearch",
+      "WebFetch(domain:developers.jane.app)",
+      "WebFetch(domain:mobilitypluschiropractic.janeapp.com)",
+      "WebFetch(domain:apitracker.io)",
+      "WebFetch(domain:blog.apify.com)",
+      "WebFetch(domain:jane-api.readme.io)",
+      "WebFetch(domain:www.browserless.io)",
+      "WebFetch(domain:scrapfly.io)",
+      "Bash(python scripts/discover_jane_api.py)",
+      "Bash(grep -v '^\\\\s*$')",
+      "Bash(git push:*)"
     ]
   }
 }

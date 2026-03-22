@@ -3,3 +3,7 @@ logs/
 __pycache__/
 *.pyc
 .DS_Store
+conversation_log.jsonl
+state.json
+scripts/*_page_*.txt
+scripts/*_api_calls.json
