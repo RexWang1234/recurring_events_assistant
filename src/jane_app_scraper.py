@@ -3,12 +3,12 @@ Jane App availability scraper.
 
 Uses Playwright to establish a session and intercept the internal
 /api/v2/openings/for_discipline API response — no text parsing, no AI,
-no screenshots. Returns clean structured slot data.
+no screenshots. Returns clean structured slot data including staff names.
 """
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from playwright.async_api import async_playwright, Response
 
@@ -17,12 +17,40 @@ logger = logging.getLogger(__name__)
 WEEKS_TO_SCAN = 3
 
 
-async def _get_openings(booking_url: str, preferences: str) -> list[dict]:
+def _service_keywords(event_name: str, preferences: str) -> list[str]:
+    """Return ordered list of text labels to try clicking on the Jane App booking page."""
+    combined = (event_name + " " + preferences).lower()
+
+    if "massage" in combined:
+        return ["Registered Massage", "Massage Therapy", "Massage"]
+    elif "chiro" in combined:
+        return ["Chiropractic", "Chiropractor", "Chiro"]
+    elif "acupuncture" in combined or "acupunct" in combined:
+        return ["Acupuncture", "Acupuncturist"]
+    elif "physio" in combined:
+        return ["Physiotherapy", "Physiotherapist", "Physio"]
+    elif "naturo" in combined:
+        return ["Naturopathic", "Naturopath", "Naturopathic Doctor"]
+    elif "osteo" in combined:
+        return ["Osteopathy", "Osteopath"]
+    elif "kinesio" in combined or "kinesiolog" in combined:
+        return ["Kinesiology", "Kinesiologist"]
+    else:
+        # Generic: use the event name itself, then a few common variants
+        return [event_name, event_name.title(), event_name.upper()]
+
+
+async def _get_openings(
+    booking_url: str, event_name: str, preferences: str
+) -> tuple[list[dict], dict[int, str]]:
     """
-    Navigate Jane App, click the massage service, intercept the openings API
-    response, and return the raw opening objects.
+    Navigate Jane App, click the appropriate service, intercept the openings API
+    response, and also capture staff member names.
+
+    Returns (openings, staff_map) where staff_map is {id: name}.
     """
-    openings = []
+    openings: list[dict] = []
+    staff_map: dict[int, str] = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -35,17 +63,26 @@ async def _get_openings(booking_url: str, preferences: str) -> list[dict]:
         )
         page = await context.new_page()
 
-        # Intercept the openings API response
-        captured = []
+        captured_openings: list[dict] = []
+        captured_staff: list[dict] = []
 
         async def on_response(response: Response):
-            if "openings/for_discipline" in response.url and response.status == 200:
-                try:
+            url = response.url
+            if response.status != 200:
+                return
+            if "janeapp" not in url:
+                return
+            try:
+                if "openings/for_discipline" in url:
                     data = await response.json()
-                    captured.append(data)
-                    logger.info(f"[jane] Captured openings response: {response.url}")
-                except Exception:
-                    pass
+                    captured_openings.append(data)
+                    logger.info(f"[jane] Captured openings: {url}")
+                elif "staff_members" in url or "practitioners" in url:
+                    data = await response.json()
+                    captured_staff.append(data)
+                    logger.info(f"[jane] Captured staff: {url}")
+            except Exception:
+                pass
 
         page.on("response", on_response)
 
@@ -53,33 +90,33 @@ async def _get_openings(booking_url: str, preferences: str) -> list[dict]:
         await page.goto(booking_url, wait_until="networkidle", timeout=30000)
         await page.wait_for_timeout(1000)
 
-        # Click the Massage Therapy / Registered Massage link
-        for kw in ["Registered Massage", "Massage Therapy", "Massage"]:
+        # Click the appropriate service
+        service_keywords = _service_keywords(event_name, preferences)
+        logger.info(f"[jane] Trying service keywords: {service_keywords}")
+        clicked = False
+        for kw in service_keywords:
             try:
                 el = page.get_by_text(kw, exact=False).first
                 if await el.is_visible(timeout=3000):
                     await el.click()
-                    logger.info(f"[jane] Clicked: '{kw}'")
-                    # Wait for the openings API to fire
+                    logger.info(f"[jane] Clicked service: '{kw}'")
                     await page.wait_for_timeout(3000)
+                    clicked = True
                     break
             except Exception:
                 continue
 
+        if not clicked:
+            logger.warning(f"[jane] Could not find service for event='{event_name}', trying first clickable treatment")
+
         # If we got the first week, navigate forward to get more weeks
-        if captured:
+        if captured_openings:
             for week in range(1, WEEKS_TO_SCAN):
                 try:
-                    next_date = (
-                        datetime.now(timezone.utc) + timedelta(weeks=week)
-                    ).strftime("%Y-%m-%d")
-
-                    # Wait for the next response after navigating
                     async with page.expect_response(
                         lambda r: "openings/for_discipline" in r.url and r.status == 200,
                         timeout=5000,
                     ) as resp_info:
-                        # Click "Next 7 Days" button
                         for btn_text in ["Next 7 Days", "Next", "›", ">"]:
                             try:
                                 btn = page.get_by_text(btn_text, exact=False).first
@@ -91,7 +128,7 @@ async def _get_openings(booking_url: str, preferences: str) -> list[dict]:
 
                     response = await resp_info.value
                     data = await response.json()
-                    captured.append(data)
+                    captured_openings.append(data)
                     logger.info(f"[jane] Captured week {week + 1} openings")
                 except Exception as e:
                     logger.debug(f"[jane] Could not get week {week + 1}: {e}")
@@ -100,56 +137,64 @@ async def _get_openings(booking_url: str, preferences: str) -> list[dict]:
         await browser.close()
 
         # Flatten all opening objects from all captured responses
-        for data in captured:
+        for data in captured_openings:
             if isinstance(data, list):
                 openings.extend(data)
             elif isinstance(data, dict):
-                # Common wrapper patterns
                 for key in ("openings", "data", "slots", "appointments"):
                     if key in data and isinstance(data[key], list):
                         openings.extend(data[key])
                         break
                 else:
-                    # Maybe the dict itself is one opening
                     if "time" in data or "start_at" in data or "start" in data:
                         openings.append(data)
 
-    return openings
+        # Build staff ID → name map
+        for data in captured_staff:
+            entries = []
+            if isinstance(data, list):
+                entries = data
+            elif isinstance(data, dict):
+                for key in ("staff_members", "practitioners", "data", "staff"):
+                    if key in data and isinstance(data[key], list):
+                        entries = data[key]
+                        break
+            for entry in entries:
+                sid = entry.get("id")
+                name = entry.get("full_name") or entry.get("name") or entry.get("display_name")
+                if sid and name:
+                    staff_map[int(sid)] = name
+
+        logger.info(f"[jane] Staff map: {staff_map}")
+
+    return openings, staff_map
 
 
-def _parse_openings(openings: list[dict], preferences: str) -> list[str]:
+def _parse_openings(
+    openings: list[dict], preferences: str, staff_map: dict[int, str]
+) -> list[str]:
     """Convert raw opening dicts into human-readable slot strings.
 
     Jane App openings schema:
       start_at: ISO datetime string
       end_at:   ISO datetime string
       duration: integer in SECONDS (e.g. 2700 = 45 min, 3600 = 60 min)
-      staff_member_id: integer (no name in this endpoint)
+      staff_member_id: integer
       status: "opening"
     """
     slots = []
     seen = set()
-
-    # Preference: preferred duration in minutes
-    pref_lower = preferences.lower()
-    preferred_duration_min = None
-    for dur in ["90", "75", "60", "45", "30"]:
-        if dur in pref_lower:
-            preferred_duration_min = int(dur)
-            break
 
     for opening in openings:
         start = opening.get("start_at")
         if not start:
             continue
 
-        # duration is in seconds → convert to minutes
         duration_sec = opening.get("duration")
         duration_min = int(duration_sec) // 60 if duration_sec else None
 
-        # Note: duration filtering not applied here — the API returns slots for
-        # a specific treatment (set by the booking page default). Slot duration
-        # is shown in the label so the user can choose appropriately.
+        staff_id = opening.get("staff_member_id")
+        staff_name = staff_map.get(int(staff_id)) if staff_id else None
 
         try:
             dt = datetime.fromisoformat(str(start))
@@ -157,6 +202,8 @@ def _parse_openings(openings: list[dict], preferences: str) -> list[str]:
             label = dt_local.strftime("%a %b %-d – %-I:%M %p")
             if duration_min:
                 label += f" ({duration_min} min)"
+            if staff_name:
+                label += f" with {staff_name}"
 
             if label not in seen:
                 seen.add(label)
@@ -164,16 +211,17 @@ def _parse_openings(openings: list[dict], preferences: str) -> list[str]:
         except Exception:
             continue
 
-    # Sort by datetime, return labels only
     slots.sort(key=lambda x: x[0])
     return [label for _, label in slots[:8]]
 
 
-async def get_jane_availability(booking_url: str, preferences: str = "") -> dict:
-    """Main entry point — returns {"slots": [...], "message": "..."}"""
+async def get_jane_availability(
+    booking_url: str, event_name: str = "Massage", preferences: str = ""
+) -> dict:
+    """Main entry point — returns {"slots": [...], "message": ""}"""
     try:
-        openings = await _get_openings(booking_url, preferences)
-        logger.info(f"[jane] Total raw openings captured: {len(openings)}")
+        openings, staff_map = await _get_openings(booking_url, event_name, preferences)
+        logger.info(f"[jane] Total raw openings: {len(openings)}, staff known: {len(staff_map)}")
 
         if not openings:
             return {
@@ -181,7 +229,7 @@ async def get_jane_availability(booking_url: str, preferences: str = "") -> dict
                 "message": "Could not retrieve availability from the booking site.",
             }
 
-        slots = _parse_openings(openings, preferences)
+        slots = _parse_openings(openings, preferences, staff_map)
 
         if not slots:
             return {
@@ -196,6 +244,8 @@ async def get_jane_availability(booking_url: str, preferences: str = "") -> dict
         return {"slots": [], "message": f"Error checking availability: {e}"}
 
 
-def get_available_slots_jane(booking_url: str, preferences: str = "") -> dict:
+def get_available_slots_jane(
+    booking_url: str, event_name: str = "Massage", preferences: str = ""
+) -> dict:
     """Sync wrapper."""
-    return asyncio.run(get_jane_availability(booking_url, preferences))
+    return asyncio.run(get_jane_availability(booking_url, event_name, preferences))

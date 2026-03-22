@@ -26,6 +26,7 @@ BASE_DIR = Path(__file__).parent.parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 STATE_PATH = BASE_DIR / "state.json"
 USER_INFO_PATH = BASE_DIR / "user_info.yaml"
+CONVO_LOG_PATH = BASE_DIR / "conversation_log.jsonl"
 
 _anthropic = anthropic.Anthropic()
 MAX_HISTORY = 40  # max messages kept in memory
@@ -55,6 +56,18 @@ def _load_user_info() -> dict:
         with open(USER_INFO_PATH) as f:
             return yaml.safe_load(f) or {}
     return {}
+
+
+def _log_event(chat_id: str, event_type: str, **fields):
+    """Append one structured record to conversation_log.jsonl."""
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "chat_id": chat_id,
+        "event": event_type,
+        **fields,
+    }
+    with open(CONVO_LOG_PATH, "a") as f:
+        f.write(json.dumps(record, default=str) + "\n")
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
@@ -119,10 +132,15 @@ async def _execute_tool(name: str, inputs: dict, config: dict, user_info: dict) 
         )
         slots = result.get("slots", [])
         note = result.get("message", "")
+        booking_url = ev_config["booking_url"]
         if not slots:
-            return f"No available slots found. {note}".strip()
+            return f"No available slots found for {event_name}. {note}\nBook manually: {booking_url}".strip()
         slot_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(slots))
-        return f"Available slots:\n{slot_list}" + (f"\n\n{note}" if note else "")
+        return (
+            f"Available slots for {event_name}:\n{slot_list}"
+            + (f"\n\n{note}" if note else "")
+            + f"\n\nBook here: {booking_url}"
+        )
 
     elif name == "prepare_booking":
         event_name = inputs["event_name"]
@@ -184,11 +202,11 @@ Configured recurring events:
 {events_desc}{user_desc}
 
 Your job:
-- Proactively check the calendar and alert the user when appointments are coming due.
-- Help them find available slots using your tools.
+- When checking the calendar (scheduled or on request): call get_calendar_status, then for EVERY event that is due soon and not yet booked, automatically call fetch_available_slots so the user gets the full picture in one message.
+- When presenting slots, always include the booking link from the tool result so the user can book directly.
 - Be warm, concise, and conversational — not robotic or menu-driven.
-- When presenting slots, just list them naturally. Let the user reply however feels natural.
-- Booking is not available yet — if the user wants to book, tell them to book manually for now and share the booking URL from the event config.
+- When listing slots, present them naturally (numbered list). Mention the clinic/site name and include the booking link.
+- Booking submission is not available through the bot — always direct the user to the booking link to complete it.
 - If the user chats casually, respond naturally."""
 
 
@@ -218,19 +236,38 @@ async def run_agent(bot: Bot, chat_id: str, trigger_message: str):
     history: list = state.get("_conversation_history", [])
 
     history.append({"role": "user", "content": trigger_message})
+    _log_event(chat_id, "user_message", content=trigger_message)
     system = _build_system_prompt(config, user_info)
 
     while True:
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _anthropic.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1024,
-                system=system,
-                tools=TOOLS,
-                messages=history,
-            ),
-        )
+        try:
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _anthropic.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=1024,
+                    system=system,
+                    tools=TOOLS,
+                    messages=history,
+                ),
+            )
+        except Exception as e:
+            if "400" in str(e) and ("tool_use_id" in str(e) or "tool_result" in str(e)):
+                # Stale history with mismatched tool IDs — reset and retry fresh
+                logger.warning("Stale conversation history detected, resetting.")
+                history = [{"role": "user", "content": trigger_message}]
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: _anthropic.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=1024,
+                        system=system,
+                        tools=TOOLS,
+                        messages=history,
+                    ),
+                )
+            else:
+                raise
 
         # Log token usage and cost (Haiku: $0.80/M input, $4.00/M output)
         in_tok = response.usage.input_tokens
@@ -239,13 +276,20 @@ async def run_agent(bot: Bot, chat_id: str, trigger_message: str):
         tool_names = [b.name for b in response.content if b.type == "tool_use"]
         step = ", ".join(tool_names) if tool_names else "reply"
         logger.info(f"[tokens] in={in_tok} out={out_tok} cost=${cost:.5f} | {step}")
+        _log_event(
+            chat_id, "llm_call",
+            tools_called=tool_names,
+            in_tokens=in_tok, out_tokens=out_tok, cost_usd=round(cost, 6),
+        )
 
         text_parts = [b.text for b in response.content if b.type == "text"]
         tool_uses = [b for b in response.content if b.type == "tool_use"]
 
         # Send any text response to Telegram
         if text_parts:
-            await bot.send_message(chat_id=chat_id, text="\n".join(text_parts))
+            reply_text = "\n".join(text_parts)
+            await bot.send_message(chat_id=chat_id, text=reply_text)
+            _log_event(chat_id, "assistant_reply", content=reply_text)
 
         # Persist assistant turn
         history.append({"role": "assistant", "content": _serialize_content(response.content)})
@@ -257,12 +301,25 @@ async def run_agent(bot: Bot, chat_id: str, trigger_message: str):
         tool_results = []
         for tu in tool_uses:
             if tu.name in ("fetch_available_slots", "prepare_booking", "submit_booking"):
-                await bot.send_message(chat_id=chat_id, text="_(on it, give me a moment...)_", parse_mode="Markdown")
+                ev_name = tu.input.get("event_name", "")
+                ev_cfg = next((e for e in config["events"] if e["name"].lower() == ev_name.lower()), None)
+                if ev_cfg and ev_name:
+                    domain = ev_cfg["booking_url"].split("/")[2]
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"_(Checking {ev_name} availability at {domain}...)_",
+                        parse_mode="Markdown",
+                    )
+                else:
+                    await bot.send_message(chat_id=chat_id, text="_(on it, give me a moment...)_", parse_mode="Markdown")
+            _log_event(chat_id, "tool_call", tool=tu.name, inputs=tu.input)
             try:
                 result = await _execute_tool(tu.name, tu.input, config, user_info)
+                _log_event(chat_id, "tool_result", tool=tu.name, result_preview=result[:300])
             except Exception as e:
                 logger.exception(f"Tool {tu.name} failed")
                 result = f"Error running {tu.name}: {e}"
+                _log_event(chat_id, "tool_error", tool=tu.name, error=str(e))
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tu.id,

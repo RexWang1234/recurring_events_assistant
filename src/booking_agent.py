@@ -382,15 +382,31 @@ User info: {user_info}
 def get_available_slots(booking_url: str, event_name: str, preferences: str) -> dict:
     """Return {"slots": [...], "message": "..."} without completing the booking.
 
-    Routes to a site-specific scraper when available (faster, more reliable),
-    falls back to the generic AI browser agent.
+    Routing strategy (fastest/most-reliable first):
+      1. Jane App  → dedicated API-interception scraper (zero AI cost)
+      2. Everything else → generic API sniffer (intercepts JSON APIs, Claude parses)
+
+    The old AI browser agent (_run_get_slots) is retired — it required screenshots
+    to work reliably and failed without them.
     """
     from src.jane_app_scraper import get_available_slots_jane
+    from src.booksy_scraper import get_available_slots_booksy
+    from src.generic_api_sniffer import get_available_slots_generic
 
     if "janeapp.com" in booking_url:
-        return get_available_slots_jane(booking_url, preferences)
+        # Dedicated scraper: intercepts known API endpoint, fastest, no AI cost
+        return get_available_slots_jane(booking_url, event_name, preferences)
 
-    return asyncio.run(_run_get_slots(booking_url, event_name, preferences))
+    if "booksy.com" in booking_url:
+        # Dedicated scraper: follows Booksy's multi-step booking flow
+        result = get_available_slots_booksy(booking_url, event_name, preferences)
+        if result["slots"]:
+            return result
+        logger.warning("[booksy] Dedicated scraper got no slots, falling back to generic sniffer")
+        return get_available_slots_generic(booking_url, event_name, preferences)
+
+    # All other sites: generic API sniffer (captures JSON APIs, Claude parses result)
+    return get_available_slots_generic(booking_url, event_name, preferences)
 
 
 def complete_booking(

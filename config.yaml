@@ -17,3 +17,20 @@ events:
     booking_url: "https://mobilitypluschiropractic.janeapp.com/"
     booking_preferences: "Weekday afternoon, 60 min deep tissue"
     calendar_search_keywords: ["massage", "deep tissue", "mobility plus"]
+
+  # Example: add more events at the same clinic (uncomment and set real values)
+  # - name: Chiropractic
+  #   calendar_event_name: "Chiropractic"
+  #   frequency_weeks: 4
+  #   alert_days_before: 7
+  #   booking_url: "https://mobilitypluschiropractic.janeapp.com/"
+  #   booking_preferences: "Any weekday"
+  #   calendar_search_keywords: ["chiro", "chiropractic", "adjustment"]
+  #
+  # - name: Acupuncture
+  #   calendar_event_name: "Acupuncture"
+  #   frequency_weeks: 3
+  #   alert_days_before: 7
+  #   booking_url: "https://mobilitypluschiropractic.janeapp.com/"
+  #   booking_preferences: "Any weekday"
+  #   calendar_search_keywords: ["acupuncture"]
