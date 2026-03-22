@@ -1,13 +1,7 @@
 """
-Long-running Telegram bot + daily calendar scheduler.
-
-Runs two async tasks concurrently:
-  1. Telegram polling — handles user replies, drives the booking conversation
-  2. APScheduler — fires a calendar check every 24 hours (and on startup)
-
-Conversation state machine (per event):
-  idle → awaiting_confirm → fetching_slots → awaiting_slot_choice
-       → awaiting_final_confirm → booking_complete
+Telegram bot backed by a Claude AI agent.
+Natural conversation replaces the old state machine — Claude decides what to say
+and when to call tools (check calendar, fetch slots, book).
 """
 
 import asyncio
@@ -17,6 +11,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import anthropic
 import yaml
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot, Update
@@ -31,6 +26,10 @@ BASE_DIR = Path(__file__).parent.parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 STATE_PATH = BASE_DIR / "state.json"
 USER_INFO_PATH = BASE_DIR / "user_info.yaml"
+
+_anthropic = anthropic.Anthropic()
+MAX_HISTORY = 40  # max messages kept in memory
+
 
 # ── State helpers ──────────────────────────────────────────────────────────────
 
@@ -58,352 +57,242 @@ def _load_user_info() -> dict:
     return {}
 
 
-# ── Calendar check + alert ─────────────────────────────────────────────────────
+# ── Tools ──────────────────────────────────────────────────────────────────────
 
-async def check_calendar_and_alert(bot: Bot, chat_id: str):
-    """
-    For each configured event: check Apple Calendar.
-    If no upcoming booking and due date is within alert_days_before, send a Telegram alert.
-    Skip if an alert was already sent today for that event.
-    """
-    config = _load_config()
-    state = _load_state()
-    today = datetime.now(timezone.utc).date().isoformat()
+TOOLS = [
+    {
+        "name": "get_calendar_status",
+        "description": (
+            "Check Apple Calendar for all configured recurring events. "
+            "Returns each event's last occurrence, next due date, days until due, "
+            "and whether a future appointment is already booked."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "fetch_available_slots",
+        "description": (
+            "Browse the booking website to find available appointment slots for a specific event. "
+            "This takes ~30–60 seconds as it actually opens the site."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_name": {
+                    "type": "string",
+                    "description": "Name of the event to book (e.g. 'Massage', 'Haircut')",
+                },
+            },
+            "required": ["event_name"],
+        },
+    },
+]
 
-    for ev in config["events"]:
-        event_key = ev["name"]
-        ev_state = state.get(event_key, {})
 
-        # Skip if already in an active booking conversation
-        if ev_state.get("conversation_state") not in (None, "idle", "booking_complete"):
-            logger.info(f"[{event_key}] Skipping check — active conversation.")
-            continue
+async def _execute_tool(name: str, inputs: dict, config: dict, user_info: dict) -> str:
+    """Run a tool and return a string result for Claude."""
+    if name == "get_calendar_status":
+        lines = []
+        for ev in config["events"]:
+            status = get_event_status(ev)
+            lines.append(
+                f"{ev['name']}: last={status['last_occurrence']}, "
+                f"next_due={status['next_due']}, days_until_due={status['days_until_due']}, "
+                f"already_booked={status['next_scheduled']}"
+            )
+        return "\n".join(lines) if lines else "No events configured."
 
-        # Skip if alert already sent today
-        if ev_state.get("last_alert_date") == today:
-            logger.info(f"[{event_key}] Alert already sent today.")
-            continue
-
-        status = get_event_status(ev)
-        days_until = status["days_until_due"]
-        next_scheduled = status["next_scheduled"]
-
-        logger.info(
-            f"[{event_key}] days_until_due={days_until}, next_scheduled={next_scheduled}"
+    elif name == "fetch_available_slots":
+        event_name = inputs["event_name"]
+        ev_config = next(
+            (e for e in config["events"] if e["name"].lower() == event_name.lower()), None
         )
-
-        # If there's already a future appointment booked, no action needed
-        if next_scheduled is not None:
-            logger.info(f"[{event_key}] Already booked for {next_scheduled.date()}. No alert.")
-            continue
-
-        # Alert if within the reminder window
-        if days_until is None:
-            # No past occurrences found — alert regardless
-            msg = (
-                f"📅 *{ev['name']}* — I couldn't find any past {ev['name'].lower()} in your calendar. "
-                f"It looks like it's overdue! Want me to check availability?\n\nReply *yes* to proceed or *skip* to ignore."
-            )
-        elif days_until <= ev["alert_days_before"]:
-            due_str = (datetime.now(timezone.utc) + timedelta(days=days_until)).strftime("%a %b %-d")
-            msg = (
-                f"📅 *{ev['name']}* is due around {due_str} ({days_until} day(s) away) "
-                f"and you don't have one booked yet.\n\n"
-                f"Want me to check availability at the {ev['name'].lower()} place?\n\n"
-                f"Reply *yes* to proceed or *skip* to ignore."
-            )
-        else:
-            logger.info(f"[{event_key}] Due in {days_until} days — outside alert window ({ev['alert_days_before']}d).")
-            continue
-
-        await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-
-        state[event_key] = {
-            **ev_state,
-            "conversation_state": "awaiting_confirm",
-            "last_alert_date": today,
-            "booking_url": ev["booking_url"],
-            "booking_preferences": ev["booking_preferences"],
-            "event_config": ev,
-        }
-        _save_state(state)
-        logger.info(f"[{event_key}] Alert sent.")
-
-
-# ── Telegram message handler ───────────────────────────────────────────────────
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route incoming Telegram messages to the right conversation handler."""
-    text = (update.message.text or "").strip().lower()
-    chat_id = str(update.effective_chat.id)
-
-    state = _load_state()
-
-    # Find which event has an active conversation
-    active_event = None
-    for event_key, ev_state in state.items():
-        conv_state = ev_state.get("conversation_state")
-        if conv_state and conv_state not in ("idle", "booking_complete"):
-            active_event = event_key
-            break
-
-    if active_event is None:
-        # No active conversation — run a fresh calendar check, same as the scheduler
-        await check_calendar_and_alert(context.bot, chat_id)
-        # If still nothing was triggered, let the user know
-        state = _load_state()
-        active_event = next(
-            (k for k, v in state.items() if v.get("conversation_state") == "awaiting_confirm"),
-            None,
-        )
-        if active_event is None:
-            await update.message.reply_text("Everything looks good — nothing due soon! 👍")
-        return
-
-    ev_state = state[active_event]
-    conv_state = ev_state.get("conversation_state")
-    config = _load_config()
-    ev_config = next((e for e in config["events"] if e["name"] == active_event), ev_state.get("event_config", {}))
-
-    # ── awaiting_confirm ────────────────────────────────────────────────────
-    if conv_state == "awaiting_confirm":
-        if text in ("yes", "y", "sure", "ok", "yeah", "yep"):
-            await update.message.reply_text(
-                f"Got it! Let me check availability for *{active_event}*... 🔍\n"
-                f"_(This may take a minute while I browse the site)_",
-                parse_mode="Markdown",
-            )
-            state[active_event]["conversation_state"] = "fetching_slots"
-            _save_state(state)
-
-            # Run in background so Telegram doesn't time out
-            asyncio.create_task(
-                _fetch_slots_and_reply(
-                    bot=context.bot,
-                    chat_id=chat_id,
-                    active_event=active_event,
-                    ev_config=ev_config,
-                    ev_state=ev_state,
-                )
-            )
-
-        elif text in ("no", "n", "skip", "later", "nope"):
-            state[active_event]["conversation_state"] = "idle"
-            _save_state(state)
-            await update.message.reply_text(
-                f"No problem! I'll remind you again next time. 👍"
-            )
-        else:
-            await update.message.reply_text("Please reply *yes* to check availability or *skip* to ignore.", parse_mode="Markdown")
-
-    # ── awaiting_slot_choice ────────────────────────────────────────────────
-    elif conv_state == "awaiting_slot_choice":
-        slots = ev_state.get("slots", [])
-        if text == "skip":
-            state[active_event]["conversation_state"] = "idle"
-            _save_state(state)
-            await update.message.reply_text("OK, skipping for now. I'll remind you again later. 👍")
-            return
-
-        # Accept a number (1, 2, 3...) or "refresh"
-        if text == "refresh":
-            state[active_event]["conversation_state"] = "fetching_slots"
-            _save_state(state)
-            await update.message.reply_text("Refreshing available slots... 🔄")
-            asyncio.create_task(
-                _fetch_slots_and_reply(
-                    bot=context.bot,
-                    chat_id=chat_id,
-                    active_event=active_event,
-                    ev_config=ev_config,
-                    ev_state=ev_state,
-                )
-            )
-            return
-
-        try:
-            choice = int(text)
-            if 1 <= choice <= len(slots):
-                chosen_slot = slots[choice - 1]
-                state[active_event]["chosen_slot"] = chosen_slot
-                state[active_event]["conversation_state"] = "awaiting_final_confirm"
-                _save_state(state)
-                await update.message.reply_text(
-                    f"You chose: *{chosen_slot}*\n\n"
-                    f"I'll now fill in the booking form and show you a summary before confirming.\n"
-                    f"_(Browsing the site...)_",
-                    parse_mode="Markdown",
-                )
-                asyncio.create_task(
-                    _prepare_booking_and_confirm(
-                        bot=context.bot,
-                        chat_id=chat_id,
-                        active_event=active_event,
-                        ev_config=ev_config,
-                        ev_state=ev_state,
-                        chosen_slot=chosen_slot,
-                    )
-                )
-            else:
-                await update.message.reply_text(
-                    f"Please reply with a number between 1 and {len(slots)}, or *skip*.",
-                    parse_mode="Markdown",
-                )
-        except ValueError:
-            await update.message.reply_text(
-                f"Please reply with a number (1–{len(slots)}) to choose a slot, or *skip*.",
-                parse_mode="Markdown",
-            )
-
-    # ── awaiting_final_confirm ──────────────────────────────────────────────
-    elif conv_state == "awaiting_final_confirm":
-        if text in ("confirm", "yes", "y", "book it", "proceed"):
-            chosen_slot = ev_state.get("chosen_slot", "")
-            user_info = _load_user_info()
-
-            await update.message.reply_text("Submitting your booking now... ⏳")
-            state[active_event]["conversation_state"] = "booking"
-            _save_state(state)
-
-            asyncio.create_task(
-                _submit_booking(
-                    bot=context.bot,
-                    chat_id=chat_id,
-                    active_event=active_event,
-                    ev_config=ev_config,
-                    chosen_slot=chosen_slot,
-                    user_info=user_info,
-                )
-            )
-
-        elif text in ("cancel", "no", "n", "back"):
-            state[active_event]["conversation_state"] = "awaiting_slot_choice"
-            _save_state(state)
-            slots = ev_state.get("slots", [])
-            slots_text = _format_slots(slots)
-            await update.message.reply_text(
-                f"OK, cancelled. Here are the slots again:\n\n{slots_text}\n\nReply with a number or *skip*.",
-                parse_mode="Markdown",
-            )
-        else:
-            await update.message.reply_text(
-                "Reply *confirm* to complete the booking, or *cancel* to go back.",
-                parse_mode="Markdown",
-            )
-
-    else:
-        await update.message.reply_text(
-            "I'm not sure what to do with that right now. I'll reach out when your next appointment is due! 👍"
-        )
-
-
-# ── Async background tasks ─────────────────────────────────────────────────────
-
-def _format_slots(slots: list[str]) -> str:
-    return "\n".join(f"  *{i+1}.* {slot}" for i, slot in enumerate(slots))
-
-
-async def _fetch_slots_and_reply(bot, chat_id, active_event, ev_config, ev_state):
-    """Background task: browse booking site, collect slots, message user."""
-    state = _load_state()
-    try:
+        if ev_config is None:
+            return f"Unknown event: {event_name}"
         result = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: get_available_slots(
                 booking_url=ev_config["booking_url"],
-                event_name=active_event,
+                event_name=event_name,
                 preferences=ev_config.get("booking_preferences", ""),
             ),
         )
         slots = result.get("slots", [])
         note = result.get("message", "")
-
         if not slots:
-            msg = f"😔 No available slots found for *{active_event}*."
-            if note:
-                msg += f"\n\n_{note}_"
-            msg += "\n\nReply *retry* to try again or *skip* to ignore."
-            state[active_event]["conversation_state"] = "awaiting_confirm"
-        else:
-            slots_text = _format_slots(slots)
-            msg = f"Here are the available slots for *{active_event}*:\n\n{slots_text}"
-            if note:
-                msg += f"\n\n_{note}_"
-            msg += "\n\nReply with a number to choose, *refresh* to reload, or *skip* to ignore."
-            state[active_event]["slots"] = slots
-            state[active_event]["conversation_state"] = "awaiting_slot_choice"
+            return f"No available slots found. {note}".strip()
+        slot_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(slots))
+        return f"Available slots:\n{slot_list}" + (f"\n\n{note}" if note else "")
 
-    except Exception as e:
-        logger.exception(f"[{active_event}] Error fetching slots")
-        msg = f"⚠️ Something went wrong while checking availability: {e}\n\nReply *yes* to try again."
-        state[active_event]["conversation_state"] = "awaiting_confirm"
-
-    _save_state(state)
-    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-
-
-async def _prepare_booking_and_confirm(bot, chat_id, active_event, ev_config, ev_state, chosen_slot):
-    """Background task: fill the booking form, show summary, wait for final confirm."""
-    state = _load_state()
-    user_info = _load_user_info()
-    try:
+    elif name == "prepare_booking":
+        event_name = inputs["event_name"]
+        chosen_slot = inputs["chosen_slot"]
+        ev_config = next(
+            (e for e in config["events"] if e["name"].lower() == event_name.lower()), None
+        )
+        if ev_config is None:
+            return f"Unknown event: {event_name}"
         summary = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: complete_booking(
                 booking_url=ev_config["booking_url"],
-                event_name=active_event,
+                event_name=event_name,
                 preferences=ev_config.get("booking_preferences", ""),
                 chosen_slot=chosen_slot,
                 user_info=user_info,
             ),
         )
-        msg = (
-            f"📋 *Booking summary for {active_event}*\n\n"
-            f"```\n{summary[:800]}\n```\n\n"
-            f"Reply *confirm* to complete this booking, or *cancel* to go back."
+        return summary[:1000]
+
+    elif name == "submit_booking":
+        event_name = inputs["event_name"]
+        chosen_slot = inputs["chosen_slot"]
+        ev_config = next(
+            (e for e in config["events"] if e["name"].lower() == event_name.lower()), None
         )
-        state[active_event]["conversation_state"] = "awaiting_final_confirm"
-    except Exception as e:
-        logger.exception(f"[{active_event}] Error preparing booking")
-        msg = f"⚠️ Error preparing the booking: {e}\n\nReply *yes* to start over."
-        state[active_event]["conversation_state"] = "awaiting_confirm"
-
-    _save_state(state)
-    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-
-
-async def _submit_booking(bot, chat_id, active_event, ev_config, chosen_slot, user_info):
-    """Background task: click the final confirm button."""
-    state = _load_state()
-    try:
+        if ev_config is None:
+            return f"Unknown event: {event_name}"
         confirmation = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: final_submit(
                 booking_url=ev_config["booking_url"],
-                event_name=active_event,
+                event_name=event_name,
                 chosen_slot=chosen_slot,
                 user_info=user_info,
             ),
         )
-        msg = (
-            f"✅ *{active_event} booked!*\n\n"
-            f"```\n{confirmation[:600]}\n```\n\n"
-            f"I'll keep an eye on your calendar for the next one. 📅"
+        return confirmation[:600]
+
+    return f"Unknown tool: {name}"
+
+
+def _build_system_prompt(config: dict, user_info: dict) -> str:
+    today = datetime.now().strftime("%A, %B %-d, %Y")
+    events_desc = "\n".join(
+        f"- {e['name']}: every {e['frequency_weeks']} week(s), "
+        f"alert {e['alert_days_before']} days before due"
+        for e in config.get("events", [])
+    )
+    user_desc = ""
+    if user_info:
+        user_desc = "\nUser info:\n" + "\n".join(f"  {k}: {v}" for k, v in user_info.items())
+    return f"""You are a friendly personal calendar assistant running on the user's MacBook.
+
+Today is {today}.
+
+Configured recurring events:
+{events_desc}{user_desc}
+
+Your job:
+- Proactively check the calendar and alert the user when appointments are coming due.
+- Help them find available slots using your tools.
+- Be warm, concise, and conversational — not robotic or menu-driven.
+- When presenting slots, just list them naturally. Let the user reply however feels natural.
+- Booking is not available yet — if the user wants to book, tell them to book manually for now and share the booking URL from the event config.
+- If the user chats casually, respond naturally."""
+
+
+def _serialize_content(content) -> list:
+    """Convert SDK content blocks to plain dicts for JSON storage."""
+    result = []
+    for block in content:
+        if hasattr(block, "model_dump"):
+            result.append(block.model_dump())
+        elif isinstance(block, dict):
+            result.append(block)
+        else:
+            result.append({"type": "text", "text": str(block)})
+    return result
+
+
+# ── AI Agent loop ──────────────────────────────────────────────────────────────
+
+async def run_agent(bot: Bot, chat_id: str, trigger_message: str):
+    """
+    Run one turn of the Claude agent. Claude may call multiple tools before
+    producing a final reply. Conversation history is persisted across turns.
+    """
+    config = _load_config()
+    user_info = _load_user_info()
+    state = _load_state()
+    history: list = state.get("_conversation_history", [])
+
+    history.append({"role": "user", "content": trigger_message})
+    system = _build_system_prompt(config, user_info)
+
+    while True:
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _anthropic.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1024,
+                system=system,
+                tools=TOOLS,
+                messages=history,
+            ),
         )
-        state[active_event]["conversation_state"] = "booking_complete"
-    except Exception as e:
-        logger.exception(f"[{active_event}] Error submitting booking")
-        msg = f"⚠️ The booking submission failed: {e}\n\nPlease book manually or reply *yes* to retry."
-        state[active_event]["conversation_state"] = "awaiting_confirm"
 
+        # Log token usage and cost (Haiku: $0.80/M input, $4.00/M output)
+        in_tok = response.usage.input_tokens
+        out_tok = response.usage.output_tokens
+        cost = (in_tok * 0.80 + out_tok * 4.00) / 1_000_000
+        tool_names = [b.name for b in response.content if b.type == "tool_use"]
+        step = ", ".join(tool_names) if tool_names else "reply"
+        logger.info(f"[tokens] in={in_tok} out={out_tok} cost=${cost:.5f} | {step}")
+
+        text_parts = [b.text for b in response.content if b.type == "text"]
+        tool_uses = [b for b in response.content if b.type == "tool_use"]
+
+        # Send any text response to Telegram
+        if text_parts:
+            await bot.send_message(chat_id=chat_id, text="\n".join(text_parts))
+
+        # Persist assistant turn
+        history.append({"role": "assistant", "content": _serialize_content(response.content)})
+
+        if not tool_uses:
+            break
+
+        # Execute tools, notifying for slow ones
+        tool_results = []
+        for tu in tool_uses:
+            if tu.name in ("fetch_available_slots", "prepare_booking", "submit_booking"):
+                await bot.send_message(chat_id=chat_id, text="_(on it, give me a moment...)_", parse_mode="Markdown")
+            try:
+                result = await _execute_tool(tu.name, tu.input, config, user_info)
+            except Exception as e:
+                logger.exception(f"Tool {tu.name} failed")
+                result = f"Error running {tu.name}: {e}"
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tu.id,
+                "content": result,
+            })
+
+        history.append({"role": "user", "content": tool_results})
+
+    # Trim and persist history
+    if len(history) > MAX_HISTORY:
+        history = history[-MAX_HISTORY:]
+    state["_conversation_history"] = history
     _save_state(state)
-    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
 
-# ── Agent entry point ──────────────────────────────────────────────────────────
+# ── Telegram handlers ──────────────────────────────────────────────────────────
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    text = (update.message.text or "").strip()
+    try:
+        await run_agent(context.bot, chat_id, text)
+    except Exception as e:
+        logger.exception("run_agent failed")
+        await update.message.reply_text(f"⚠️ Error: {e}")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 def run():
-    """Start the Telegram bot and daily scheduler. Blocks until stopped."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -416,9 +305,13 @@ def run():
 
     async def post_init(application):
         async def scheduled_check():
-            await check_calendar_and_alert(application.bot, chat_id)
+            await run_agent(
+                application.bot,
+                chat_id,
+                "Please check my calendar now and let me know if any recurring appointments "
+                "are coming up that I haven't booked yet.",
+            )
 
-        # Run immediately on startup, then every 24 hours
         scheduler.add_job(scheduled_check, "interval", hours=24, next_run_time=datetime.now())
         scheduler.start()
         logger.info("Scheduler started.")

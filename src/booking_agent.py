@@ -9,7 +9,6 @@ Two modes:
 """
 
 import asyncio
-import base64
 import os
 from typing import Any
 
@@ -19,11 +18,6 @@ from playwright.async_api import async_playwright
 # ── Browser tools available to Claude ─────────────────────────────────────────
 
 BROWSER_TOOLS = [
-    {
-        "name": "screenshot",
-        "description": "Take a screenshot of the current browser page and return it as an image.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
     {
         "name": "navigate",
         "description": "Navigate the browser to a URL.",
@@ -35,7 +29,7 @@ BROWSER_TOOLS = [
     },
     {
         "name": "click",
-        "description": "Click an element on the page. Prefer clicking by visible text if possible.",
+        "description": "Click an element on the page by CSS selector or visible text.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -45,6 +39,28 @@ BROWSER_TOOLS = [
                 }
             },
             "required": ["selector"],
+        },
+    },
+    {
+        "name": "press_key",
+        "description": "Press a keyboard key. Useful for dismissing modals (Escape), confirming (Enter), or navigating.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Key name e.g. 'Escape', 'Enter', 'Tab', 'ArrowRight'"}
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "wait",
+        "description": "Wait for a short period to let the page load or animate.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ms": {"type": "integer", "description": "Milliseconds to wait (max 3000)"}
+            },
+            "required": ["ms"],
         },
     },
     {
@@ -61,7 +77,7 @@ BROWSER_TOOLS = [
     },
     {
         "name": "get_page_text",
-        "description": "Get the visible text content of the current page.",
+        "description": "Get the visible text content of the current page. Use this as your primary way to read slot availability.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -104,23 +120,32 @@ RETURN_SLOTS_TOOL = {
 
 
 async def _execute_tool(page, tool_name: str, tool_input: dict) -> Any:
-    if tool_name == "screenshot":
-        screenshot_bytes = await page.screenshot(full_page=False)
-        return base64.standard_b64encode(screenshot_bytes).decode("utf-8")
-
-    elif tool_name == "navigate":
+    if tool_name == "navigate":
         await page.goto(tool_input["url"], wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(2000)
         return f"Navigated to {tool_input['url']}"
 
     elif tool_name == "click":
         selector = tool_input["selector"]
         try:
-            await page.click(selector, timeout=5000)
+            # Try CSS selector first
+            await page.click(selector, timeout=3000)
         except Exception:
-            await page.get_by_text(selector, exact=False).first.click(timeout=5000)
+            # Fall back to text match, but force-click to bypass overlays
+            await page.get_by_text(selector, exact=False).first.click(force=True, timeout=5000)
         await page.wait_for_timeout(1000)
         return f"Clicked '{selector}'"
+
+    elif tool_name == "press_key":
+        key = tool_input["key"]
+        await page.keyboard.press(key)
+        await page.wait_for_timeout(500)
+        return f"Pressed '{key}'"
+
+    elif tool_name == "wait":
+        ms = min(tool_input.get("ms", 1000), 3000)
+        await page.wait_for_timeout(ms)
+        return f"Waited {ms}ms"
 
     elif tool_name == "type_text":
         await page.fill(tool_input["selector"], tool_input["text"])
@@ -153,12 +178,14 @@ User preferences: {preferences}
 
 Your task:
 1. Navigate to the booking page.
-2. Browse through the available times (navigate to the next available week/dates if needed).
-3. Collect up to 6 available time slots that best match the user's preferences.
-4. Call the `return_slots` tool with the list of available slots as human-readable strings (e.g. "Tue Mar 25 – 2:00pm").
+2. If a modal or popup appears (e.g. "next available", cookie notice, welcome dialog), dismiss it immediately by pressing Escape or clicking outside it.
+3. Use get_page_text to read the page content. Use click, press_key, and wait to navigate.
+4. Browse available times. On Jane App sites: select a service/practitioner, then read the calendar for open slots. Navigate forward weeks if needed.
+5. Collect up to 6 available slots matching the user's preferences.
+6. Call return_slots with human-readable strings like "Tue Mar 25 – 2:00pm with Jane Smith".
 
-Do NOT complete the booking. Just find and return available slots.
-If no slots are available, call `return_slots` with an empty list and explain in the message field.
+Do NOT log in. Do NOT complete the booking. Just find and return available slots.
+If no slots are found, call return_slots with an empty list and explain why.
 """
 
     messages = [
@@ -200,18 +227,11 @@ If no slots are available, call `return_slots` with an empty list and explain in
                         }
 
                     result = await _execute_tool(page, tool_use.name, tool_use.input)
-                    if tool_use.name == "screenshot":
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": result}}],
-                        })
-                    else:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": str(result)[:4000],
-                        })
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": str(result)[:4000],
+                    })
 
                 messages.append({"role": "user", "content": tool_results})
 
@@ -285,18 +305,11 @@ Do NOT make up information. Skip optional fields if data is not provided.
                 tool_results = []
                 for tool_use in tool_uses:
                     result = await _execute_tool(page, tool_use.name, tool_use.input)
-                    if tool_use.name == "screenshot":
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": result}}],
-                        })
-                    else:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": str(result)[:4000],
-                        })
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": str(result)[:4000],
+                    })
 
                 messages.append({"role": "user", "content": tool_results})
 
@@ -348,18 +361,11 @@ User info: {user_info}
                 tool_results = []
                 for tool_use in tool_uses:
                     result = await _execute_tool(page, tool_use.name, tool_use.input)
-                    if tool_use.name == "screenshot":
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": result}}],
-                        })
-                    else:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": str(result)[:4000],
-                        })
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": str(result)[:4000],
+                    })
 
                 messages.append({"role": "user", "content": tool_results})
 
@@ -374,7 +380,16 @@ User info: {user_info}
 # ── Public sync wrappers ──────────────────────────────────────────────────────
 
 def get_available_slots(booking_url: str, event_name: str, preferences: str) -> dict:
-    """Return {"slots": [...], "message": "..."} without completing the booking."""
+    """Return {"slots": [...], "message": "..."} without completing the booking.
+
+    Routes to a site-specific scraper when available (faster, more reliable),
+    falls back to the generic AI browser agent.
+    """
+    from src.jane_app_scraper import get_available_slots_jane
+
+    if "janeapp.com" in booking_url:
+        return get_available_slots_jane(booking_url, preferences)
+
     return asyncio.run(_run_get_slots(booking_url, event_name, preferences))
 
 
@@ -452,18 +467,11 @@ If you cannot complete the booking, explain why.
                 tool_results = []
                 for tool_use in tool_uses:
                     result = await _execute_tool(page, tool_use.name, tool_use.input)
-                    if tool_use.name == "screenshot":
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": result}}],
-                        })
-                    else:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": str(result)[:4000],
-                        })
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": str(result)[:4000],
+                    })
 
                 messages.append({"role": "user", "content": tool_results})
 
