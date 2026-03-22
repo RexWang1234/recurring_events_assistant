@@ -177,7 +177,7 @@ If no slots are available, call `return_slots` with an empty list and explain in
         try:
             for _ in range(20):
                 response = client.messages.create(
-                    model="claude-sonnet-4-6",
+                    model="claude-haiku-4-5-20251001",
                     max_tokens=2048,
                     system=system_prompt,
                     tools=tools,
@@ -267,7 +267,7 @@ Do NOT make up information. Skip optional fields if data is not provided.
         try:
             for _ in range(30):
                 response = client.messages.create(
-                    model="claude-sonnet-4-6",
+                    model="claude-haiku-4-5-20251001",
                     max_tokens=2048,
                     system=system_prompt,
                     tools=BROWSER_TOOLS,
@@ -330,7 +330,7 @@ User info: {user_info}
         try:
             for _ in range(30):
                 response = client.messages.create(
-                    model="claude-sonnet-4-6",
+                    model="claude-haiku-4-5-20251001",
                     max_tokens=2048,
                     system=system_prompt,
                     tools=BROWSER_TOOLS,
@@ -434,7 +434,7 @@ If you cannot complete the booking, explain why.
         try:
             for _ in range(30):
                 response = client.messages.create(
-                    model="claude-opus-4-6",
+                    model="claude-haiku-4-5-20251001",
                     max_tokens=4096,
                     system=system_prompt,
                     tools=BROWSER_TOOLS,

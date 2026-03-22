@@ -35,8 +35,14 @@ set now to current date
 set lookbackDate to now - ({days_back} * days)
 set lookaheadDate to now + ({days_forward} * days)
 
+set skipCalendars to {{"Canadian Holidays", "Birthdays", "Siri Suggestions", "Scheduled Reminders"}}
+
 tell application "Calendar"
     repeat with c in every calendar
+        set calName to name of c
+        if skipCalendars contains calName then
+            -- skip noisy/irrelevant calendars
+        else
         try
             set eventsInRange to (every event of c whose start date >= lookbackDate and start date <= lookaheadDate)
             repeat with e in eventsInRange
@@ -61,6 +67,7 @@ tell application "Calendar"
                 set end of results to dateStr & "|" & evTitle
             end repeat
         end try
+        end if
     end repeat
 end tell
 

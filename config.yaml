@@ -6,7 +6,7 @@ events:
     calendar_event_name: "Haircut"        # keyword to search in Apple Calendar
     frequency_weeks: 4
     alert_days_before: 7                  # alert if no booking within this many days of due date
-    booking_url: "https://example-salon.com/book"
+    booking_url: "https://booksy.com/en-ca/21441_nex-barbershop_barbershop_773207_oakville?rwg_token=AFd1xnFg99B6BpgFQ1IA5Zehmjir1n8LK15cQGYZnC61gYPa-tnzzdnPqOhXqxZo7yVuEC_XmwuBFtvE6G_ZOWRNj2Ve5VWT8w%3D%3D#ba_s=seo"
     booking_preferences: "Saturday morning, any stylist"
     calendar_search_keywords: ["haircut", "hair", "salon"]
 
@@ -14,6 +14,6 @@ events:
     calendar_event_name: "Massage"
     frequency_weeks: 2
     alert_days_before: 7
-    booking_url: "https://example-massage.com/book"
+    booking_url: "https://mobilitypluschiropractic.janeapp.com/"
     booking_preferences: "Weekday afternoon, 60 min deep tissue"
-    calendar_search_keywords: ["massage", "deep tissue"]
+    calendar_search_keywords: ["massage", "deep tissue", "mobility plus"]

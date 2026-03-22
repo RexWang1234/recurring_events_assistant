@@ -148,9 +148,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
 
     if active_event is None:
-        await update.message.reply_text(
-            "No active booking conversation. I'll message you when something is due! 👍"
+        # No active conversation — run a fresh calendar check, same as the scheduler
+        await check_calendar_and_alert(context.bot, chat_id)
+        # If still nothing was triggered, let the user know
+        state = _load_state()
+        active_event = next(
+            (k for k, v in state.items() if v.get("conversation_state") == "awaiting_confirm"),
+            None,
         )
+        if active_event is None:
+            await update.message.reply_text("Everything looks good — nothing due soon! 👍")
         return
 
     ev_state = state[active_event]
@@ -405,17 +412,19 @@ def run():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
-    app = Application.builder().token(token).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     scheduler = AsyncIOScheduler()
 
-    async def scheduled_check():
-        await check_calendar_and_alert(app.bot, chat_id)
+    async def post_init(application):
+        async def scheduled_check():
+            await check_calendar_and_alert(application.bot, chat_id)
 
-    # Run immediately on startup, then every 24 hours
-    scheduler.add_job(scheduled_check, "interval", hours=24, next_run_time=datetime.now())
-    scheduler.start()
+        # Run immediately on startup, then every 24 hours
+        scheduler.add_job(scheduled_check, "interval", hours=24, next_run_time=datetime.now())
+        scheduler.start()
+        logger.info("Scheduler started.")
+
+    app = Application.builder().token(token).post_init(post_init).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Calendar Assistant starting. Listening for Telegram messages...")
     app.run_polling(allowed_updates=["message"])
