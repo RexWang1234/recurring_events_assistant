@@ -71,7 +71,7 @@ async def _get_openings(
             if response.status != 200 or "janeapp" not in url:
                 return
             try:
-                if "openings/for_discipline" in url:
+                if "openings" in url and ("discipline" in url or "treatment" in url):
                     data = await response.json()
                     captured_openings.append(data)
                     logger.info(f"[jane] Captured openings: {url}")
@@ -88,27 +88,58 @@ async def _get_openings(
         await page.goto(booking_url, wait_until="networkidle", timeout=30000)
         await page.wait_for_timeout(1000)
 
-        # Click the appropriate service
+        # Click a specific treatment link to trigger the openings API.
+        # Jane App lists treatments as <a href="#/discipline/N/treatment/M">.
+        # Strategy: find a treatment link whose text matches the service keywords.
         service_keywords = _service_keywords(event_name, preferences)
         logger.info(f"[jane] Trying service keywords: {service_keywords}")
         clicked = False
-        for kw in service_keywords:
-            try:
-                el = page.get_by_text(kw, exact=False).first
-                if await el.is_visible(timeout=3000):
-                    await el.click()
-                    logger.info(f"[jane] Clicked service: '{kw}'")
-                    service_clicked = kw
-                    await page.wait_for_timeout(3000)
+
+        # First, try to find treatment links matching our keywords
+        treatment_links = await page.query_selector_all(
+            'a[href*="/discipline/"][href*="/treatment/"]'
+        )
+        logger.info(f"[jane] Found {len(treatment_links)} treatment links")
+
+        for link in treatment_links:
+            link_text = (await link.inner_text()).strip().lower()
+            for kw in service_keywords:
+                if kw.lower() in link_text:
+                    await link.click()
+                    display_text = link_text.split("\n")[0][:60]
+                    logger.info(f"[jane] Clicked treatment: '{display_text}'")
+                    service_clicked = display_text
+                    await page.wait_for_timeout(4000)
                     clicked = True
                     break
-            except Exception:
-                continue
+            if clicked:
+                break
+
+        # Fallback: click the sidebar discipline link, then first treatment
+        if not clicked:
+            for kw in service_keywords:
+                try:
+                    sidebar = page.locator(f'a.list-group-item:has-text("{kw}")')
+                    if await sidebar.count() > 0:
+                        await sidebar.first.click()
+                        await page.wait_for_timeout(2000)
+                        # Now click first treatment link
+                        first_treatment = page.locator(
+                            'a[href*="/discipline/"][href*="/treatment/"]'
+                        ).first
+                        if await first_treatment.is_visible(timeout=3000):
+                            await first_treatment.click()
+                            logger.info(f"[jane] Clicked sidebar '{kw}' then first treatment")
+                            service_clicked = kw
+                            await page.wait_for_timeout(4000)
+                            clicked = True
+                            break
+                except Exception:
+                    continue
 
         if not clicked:
             logger.warning(
-                f"[jane] Could not find service for event='{event_name}', "
-                "trying first clickable treatment"
+                f"[jane] Could not find treatment for event='{event_name}'"
             )
 
         # Navigate forward weeks to get more availability
@@ -116,7 +147,7 @@ async def _get_openings(
             for week in range(1, WEEKS_TO_SCAN):
                 try:
                     async with page.expect_response(
-                        lambda r: "openings/for_discipline" in r.url
+                        lambda r: "openings" in r.url
                         and r.status == 200,
                         timeout=5000,
                     ) as resp_info:

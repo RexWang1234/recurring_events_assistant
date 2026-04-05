@@ -20,8 +20,8 @@ from telegram import Bot, Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from src.calendar_client import get_event_status
-from src.booking_agent import get_available_slots
-from src.slot_service import detect_platform
+from src.booking_agent import get_available_slots_multi
+from src.slot_service import get_shops
 from src import db
 
 logger = logging.getLogger(__name__)
@@ -63,9 +63,9 @@ TOOLS = [
     {
         "name": "fetch_available_slots",
         "description": (
-            "Check the booking website to find available appointment slots. "
-            "Returns a pre-filtered, ranked list of slots matching user preferences. "
-            "Takes ~30-60 seconds."
+            "Check booking websites to find available appointment slots. "
+            "If the event has multiple shops, checks all of them (or just one if shop_name is specified). "
+            "Returns a pre-filtered, ranked list of slots. Takes ~30-60 seconds per shop."
         ),
         "input_schema": {
             "type": "object",
@@ -73,6 +73,10 @@ TOOLS = [
                 "event_name": {
                     "type": "string",
                     "description": "Name of the event (e.g. 'Massage', 'Haircut')",
+                },
+                "shop_name": {
+                    "type": "string",
+                    "description": "Optional: specific shop to check. If omitted, checks all shops for this event.",
                 },
             },
             "required": ["event_name"],
@@ -87,16 +91,37 @@ async def _execute_tool(name: str, inputs: dict, config: dict) -> str:
         lines = []
         for ev in config["events"]:
             status = get_event_status(ev)
-            lines.append(
-                f"{ev['name']}: last={status['last_occurrence']}, "
-                f"next_due={status['next_due']}, "
-                f"days_until_due={status['days_until_due']}, "
-                f"already_booked={status['next_scheduled']}"
-            )
-        return "\n".join(lines) if lines else "No events configured."
+            last = status["last_occurrence"]
+            next_due = status["next_due"]
+            days = status["days_until_due"]
+            booked = status["next_scheduled"]
+
+            parts = [f"Event: {ev['name']}"]
+            shops = get_shops(ev)
+            shop_names = ", ".join(s["name"] for s in shops) if shops else "N/A"
+            parts.append(f"  Shop(s): {shop_names}")
+            if last:
+                parts.append(f"  Last visit: {last.strftime('%b %-d, %Y')}")
+                if days < 0:
+                    parts.append(f"  Next due: {next_due.strftime('%b %-d, %Y')} ({abs(days)} days overdue)")
+                else:
+                    parts.append(f"  Next due: {next_due.strftime('%b %-d, %Y')} ({days} days from now)")
+            else:
+                parts.append("  Last visit: No record found")
+            if booked:
+                parts.append(f"  Status: BOOKED on {booked.strftime('%b %-d, %Y')}")
+            elif days is not None and days < 0:
+                parts.append(f"  Status: OVERDUE by {abs(days)} days -- not booked")
+            elif days is not None and days <= ev["alert_days_before"]:
+                parts.append("  Status: DUE SOON -- not booked")
+            else:
+                parts.append("  Status: Not yet due")
+            lines.append("\n".join(parts))
+        return "\n\n".join(lines) if lines else "No events configured."
 
     elif name == "fetch_available_slots":
         event_name = inputs["event_name"]
+        shop_filter = inputs.get("shop_name", "")
         ev_config = next(
             (e for e in config["events"]
              if e["name"].lower() == event_name.lower()),
@@ -107,12 +132,7 @@ async def _execute_tool(name: str, inputs: dict, config: dict) -> str:
 
         result = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: get_available_slots(
-                booking_url=ev_config["booking_url"],
-                event_name=event_name,
-                preferences=ev_config.get("booking_preferences", ""),
-                shop_name=ev_config.get("shop_name", ""),
-            ),
+            lambda: get_available_slots_multi(ev_config, shop_filter),
         )
         return result["display"]
 
@@ -121,12 +141,16 @@ async def _execute_tool(name: str, inputs: dict, config: dict) -> str:
 
 def _build_system_prompt(config: dict, user_info: dict) -> str:
     today = datetime.now().strftime("%A, %B %-d, %Y")
-    events_desc = "\n".join(
-        f"- {e['name']}: every {e['frequency_weeks']} week(s), "
-        f"alert {e['alert_days_before']} days before due, "
-        f"book at {e.get('shop_name', '')} ({e['booking_url']})"
-        for e in config.get("events", [])
-    )
+    events_lines = []
+    for e in config.get("events", []):
+        shops = get_shops(e)
+        shop_desc = ", ".join(f"{s['name']} ({s['url']})" for s in shops)
+        events_lines.append(
+            f"- {e['name']}: every {e['frequency_weeks']} week(s), "
+            f"alert {e['alert_days_before']} days before due, "
+            f"shop(s): {shop_desc}"
+        )
+    events_desc = "\n".join(events_lines)
     user_desc = ""
     if user_info:
         user_desc = "\nUser info:\n" + "\n".join(
@@ -140,16 +164,16 @@ Configured recurring events:
 {events_desc}{user_desc}
 
 Your job:
-- When checking the calendar (scheduled or on request): call get_calendar_status, \
-then for EVERY event that is due soon and not yet booked, automatically call \
-fetch_available_slots so the user gets the full picture in one message.
-- When presenting slots, always include the booking link from the tool result \
-so the user can book directly.
+- When checking the calendar (scheduled or on request): call get_calendar_status first.
+- After receiving calendar status, present a clear summary to the user:
+  1. For each event, mention the last visit date, next due date, and current status.
+  2. Use clear labels: "Booked on [date]" for scheduled events, "Overdue by X days" or "Due in X days" for unbooked ones.
+  3. Then ask which one they'd like you to check availability for (or suggest the most urgent).
+- Do NOT automatically call fetch_available_slots for every event. Only fetch slots when the user asks for a specific event or confirms they want you to check.
+- When presenting slots, include the booking link so the user can book directly.
 - Be warm, concise, and conversational -- not robotic or menu-driven.
-- When listing slots, present them naturally (numbered list). Mention the \
-clinic/site name and include the booking link.
-- Booking submission is not available through the bot -- always direct the \
-user to the booking link to complete it.
+- When listing slots, present them as a numbered list with the shop name and booking link.
+- Booking submission is not available through the bot -- direct the user to the booking link.
 - If the user chats casually, respond naturally."""
 
 
@@ -253,17 +277,23 @@ async def run_agent(bot: Bot, chat_id: str, trigger_message: str):
             # Send progress notification for slow tools
             if tu.name == "fetch_available_slots":
                 ev_name = tu.input.get("event_name", "")
+                shop_filter = tu.input.get("shop_name", "")
                 ev_cfg = next(
                     (e for e in config["events"]
                      if e["name"].lower() == ev_name.lower()),
                     None,
                 )
                 if ev_cfg:
-                    domain = ev_cfg["booking_url"].split("/")[2]
-                    shop = ev_cfg.get("shop_name", domain)
+                    shops = get_shops(ev_cfg)
+                    if shop_filter:
+                        label = shop_filter
+                    elif len(shops) == 1:
+                        label = shops[0]["name"]
+                    else:
+                        label = f"{len(shops)} shops"
                     await bot.send_message(
                         chat_id=chat_id,
-                        text=f"_(Checking {ev_name} availability at {shop}...)_",
+                        text=f"_(Checking {ev_name} availability at {label}...)_",
                         parse_mode="Markdown",
                     )
                 else:
@@ -331,8 +361,8 @@ def run():
             await run_agent(
                 application.bot,
                 chat_id,
-                "Please check my calendar now and let me know if any recurring "
-                "appointments are coming up that I haven't booked yet.",
+                "Check my calendar status and show me a summary. "
+                "If anything is overdue or due soon, suggest I check availability.",
             )
 
         scheduler.add_job(

@@ -1,31 +1,60 @@
 # Calendar Assistant Configuration
 # Requires .env with ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#
+# calendar_search_keywords supports any language -- add Chinese, French, etc.:
+#   calendar_search_keywords: ["massage", "按摩", "deep tissue"]
+#
+# Each event can have one shop (booking_url) or multiple shops:
+#   shops:
+#     - name: "Clinic A"
+#       url: "https://clinica.janeapp.com/"
+#     - name: "Clinic B"
+#       url: "https://clinicb.janeapp.com/"
 
 events:
   - name: Haircut
-    shop_name: "NEX Barbershop"
     calendar_event_name: "Haircut"
     frequency_weeks: 4
     alert_days_before: 7
-    booking_url: "https://booksy.com/en-ca/21441_nex-barbershop_barbershop_773207_oakville"
     booking_preferences: "Saturday morning, any stylist"
     calendar_search_keywords: ["haircut", "hair", "salon"]
+    shops:
+      - name: "NEX Barbershop"
+        url: "https://booksy.com/en-ca/21441_nex-barbershop_barbershop_773207_oakville"
 
   - name: Massage
-    shop_name: "Mobility Plus Chiropractic"
     calendar_event_name: "Massage"
     frequency_weeks: 2
     alert_days_before: 7
-    booking_url: "https://mobilitypluschiropractic.janeapp.com/"
     booking_preferences: "Weekday afternoon, 60 min deep tissue"
     calendar_search_keywords: ["massage", "deep tissue", "mobility plus"]
+    shops:
+      - name: "Mobility Plus Chiropractic"
+        url: "https://mobilitypluschiropractic.janeapp.com/"
+      - name: "Robyn RMT"
+        url: "https://www.robyndeyrmt.com"
+      - name: "Oka Park RMT"
+        url: "https://oakphysiowellness.janeapp.com/locations/oak-physio-wellness-physiotherapy-clinic-in-oakville/book"
 
-  # Example: add more events (uncomment and customize)
+  - name: Hot_Yoga
+    calendar_event_name: "Yoga"
+    frequency_weeks: 2
+    alert_days_before: 7
+    booking_preferences: "Weekday evening, weekends"
+    calendar_search_keywords: ["yoga", "hot yoga", "pilates"]
+    shops:
+      - name: "iGita Yoga Studio"
+        url: "https://www.mindbodyonline.com/explore/locations/igita"
+      
+  # Example: multiple shops for one event type
   # - name: Chiropractic
-  #   shop_name: "Mobility Plus Chiropractic"
   #   calendar_event_name: "Chiropractic"
   #   frequency_weeks: 4
   #   alert_days_before: 7
-  #   booking_url: "https://mobilitypluschiropractic.janeapp.com/"
   #   booking_preferences: "Any weekday"
   #   calendar_search_keywords: ["chiro", "chiropractic", "adjustment"]
+  #   shops:
+  #     - name: "Mobility Plus Chiropractic"
+  #       url: "https://mobilitypluschiropractic.janeapp.com/"
+  #     - name: "Back in Motion"
+  #       url: "https://backinmotion.janeapp.com/"

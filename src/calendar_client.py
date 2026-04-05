@@ -5,6 +5,7 @@ No Google API or iCloud credentials required — reads directly from the local C
 """
 
 import subprocess
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -92,6 +93,19 @@ return output
     return events
 
 
+def _matches_keywords(title: str, keywords: list[str]) -> bool:
+    """Case-insensitive substring match with Unicode normalization.
+
+    Handles CJK characters, accented Latin, and different Unicode forms
+    (NFC vs NFD) that calendar apps may produce.
+    """
+    title_norm = unicodedata.normalize("NFC", title).lower()
+    return any(
+        unicodedata.normalize("NFC", kw).lower() in title_norm
+        for kw in keywords
+    )
+
+
 def get_last_occurrence(keywords: list[str]) -> datetime | None:
     """Return the datetime of the most recent past event matching any keyword."""
     now = datetime.now(timezone.utc)
@@ -99,8 +113,7 @@ def get_last_occurrence(keywords: list[str]) -> datetime | None:
 
     matches = []
     for ev in events:
-        title_lower = ev["title"].lower()
-        if any(kw.lower() in title_lower for kw in keywords):
+        if _matches_keywords(ev["title"], keywords):
             if ev["date"] <= now:
                 matches.append(ev["date"])
 
@@ -116,8 +129,7 @@ def get_next_scheduled(keywords: list[str]) -> datetime | None:
 
     matches = []
     for ev in events:
-        title_lower = ev["title"].lower()
-        if any(kw.lower() in title_lower for kw in keywords):
+        if _matches_keywords(ev["title"], keywords):
             if ev["date"] > now:
                 matches.append(ev["date"])
 

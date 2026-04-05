@@ -30,6 +30,7 @@ def cmd_run():
 
 def cmd_status():
     from src.calendar_client import get_event_status
+    from src.slot_service import get_shops
 
     config = load_config()
     print("\n── Calendar Assistant Status ───────────────────────────\n")
@@ -41,8 +42,9 @@ def cmd_status():
         next_sched = status["next_scheduled"]
 
         print(f"  Event         : {ev['name']}")
-        if ev.get("shop_name"):
-            print(f"  Shop          : {ev['shop_name']}")
+        shops = get_shops(ev)
+        for s in shops:
+            print(f"  Shop          : {s['name']} ({s['url'][:50]}...)")
         if last:
             print(f"  Last done     : {last.strftime('%Y-%m-%d')}")
             print(f"  Next due      : {next_due.strftime('%Y-%m-%d')} ({days} days away)")

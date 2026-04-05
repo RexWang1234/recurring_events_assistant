@@ -22,11 +22,16 @@ from src.models import Slot
 
 logger = logging.getLogger(__name__)
 
-# Skip analytics/tracking noise
+# Skip analytics/tracking/infrastructure noise
 _SKIP = [
     "analytics", "telemetry", "tracking", "segment", "mixpanel",
     "hotjar", "sentry", "datadog", "amplitude", "heap", "gtm",
     "facebook", "twitter", "linkedin", "ads", "beacon",
+    # Wix/platform infrastructure (not actual booking data)
+    "parastorage.com", "siteassets.", "static.parastorage",
+    "editor-elements", "thunderbolt", "manifest", "wixapps.net",
+    "identitytoolkit", "firebaseio", "cookie-consent",
+    "tag-manager", "laboratory", "feature_flags",
 ]
 
 # Prefer APIs with these URL patterns -- likely availability/booking data
@@ -90,8 +95,12 @@ async def _sniff_apis(booking_url: str, event_name: str) -> list[dict]:
         await page.goto(booking_url, wait_until="domcontentloaded", timeout=20000)
         await page.wait_for_timeout(3000)
 
-        # Try clicking a Book button near the service name
-        clicked = False
+        # Multi-step click strategy to trigger availability APIs.
+        # Many booking sites need 2 clicks: first to view services, then to
+        # select one and load slots (e.g. Wix Bookings: Book → Book Now).
+
+        # Step 1: Try clicking a Book button near the service name
+        clicked_step1 = False
         for svc_kw in [event_name, event_name.split()[0]]:
             try:
                 section = (
@@ -104,21 +113,36 @@ async def _sniff_apis(booking_url: str, event_name: str) -> list[dict]:
                 if await book_btn.is_visible(timeout=1500):
                     await book_btn.click()
                     await page.wait_for_timeout(3000)
-                    logger.info(f"[sniffer] Clicked Book near '{svc_kw}'")
-                    clicked = True
+                    logger.info(f"[sniffer] Step 1: Clicked Book near '{svc_kw}'")
+                    clicked_step1 = True
                     break
             except Exception:
                 continue
 
-        # Fallback: generic page-level triggers
-        if not clicked:
+        # Fallback step 1: generic page-level triggers
+        if not clicked_step1:
             for keyword in _CLICK_TRIGGERS:
                 try:
                     el = page.get_by_text(keyword, exact=False).first
                     if await el.is_visible(timeout=1500):
                         await el.click()
                         await page.wait_for_timeout(2000)
-                        logger.info(f"[sniffer] Clicked trigger: '{keyword}'")
+                        logger.info(f"[sniffer] Step 1: Clicked '{keyword}'")
+                        clicked_step1 = True
+                        break
+                except Exception:
+                    continue
+
+        # Step 2: If the first click loaded a service list, click into
+        # a specific service to trigger time slots / availability API.
+        if clicked_step1:
+            for btn_text in ["Book Now", "Book Appointment", "Select", "Choose"]:
+                try:
+                    btn = page.get_by_text(btn_text, exact=False).first
+                    if await btn.is_visible(timeout=2000):
+                        await btn.click()
+                        await page.wait_for_timeout(4000)
+                        logger.info(f"[sniffer] Step 2: Clicked '{btn_text}'")
                         break
                 except Exception:
                     continue
