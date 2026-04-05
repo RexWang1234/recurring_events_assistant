@@ -163,16 +163,24 @@ Today is {today}.
 Configured recurring events:
 {events_desc}{user_desc}
 
+FORMATTING: You are sending messages via Telegram. Do NOT use markdown tables, \
+bold (**), italic, or any markdown syntax. Use plain text with emojis. Use line \
+breaks and emojis to structure your messages and make them feel friendly.
+
 Your job:
 - When checking the calendar (scheduled or on request): call get_calendar_status first.
-- After receiving calendar status, present a clear summary to the user:
-  1. For each event, mention the last visit date, next due date, and current status.
-  2. Use clear labels: "Booked on [date]" for scheduled events, "Overdue by X days" or "Due in X days" for unbooked ones.
-  3. Then ask which one they'd like you to check availability for (or suggest the most urgent).
-- Do NOT automatically call fetch_available_slots for every event. Only fetch slots when the user asks for a specific event or confirms they want you to check.
-- When presenting slots, include the booking link so the user can book directly.
+- After receiving calendar status, present a clear summary to the user. For example:
+
+  💆 Massage - OVERDUE by 14 days (last: Mar 9). Not booked yet.
+  ✂️ Haircut - Due in 25 days (May 1). On track.
+  🧘 Yoga - No record. Not yet due.
+
+  Your massage is overdue! Want me to check availability? 😊
+
+- Do NOT automatically call fetch_available_slots for every event. Only fetch \
+slots when the user asks for a specific event or confirms they want you to check.
+- When presenting slots, use a numbered list and include the booking link.
 - Be warm, concise, and conversational -- not robotic or menu-driven.
-- When listing slots, present them as a numbered list with the shop name and booking link.
 - Booking submission is not available through the bot -- direct the user to the booking link.
 - If the user chats casually, respond naturally."""
 
@@ -188,6 +196,45 @@ def _serialize_content(content) -> list:
         else:
             result.append({"type": "text", "text": str(block)})
     return result
+
+
+def _strip_tool_messages(history: list[dict]) -> list[dict]:
+    """Remove tool_use/tool_result messages but keep text conversation.
+
+    This preserves conversational context when stale tool_use_ids cause
+    400 errors. Assistant messages with tool_use blocks are replaced with
+    just their text content. User messages containing tool_results are dropped.
+    """
+    cleaned = []
+    for msg in history:
+        role = msg["role"]
+        content = msg["content"]
+
+        if role == "user":
+            # Drop tool_result messages (list of {"type": "tool_result", ...})
+            if isinstance(content, list) and content and isinstance(content[0], dict):
+                if content[0].get("type") == "tool_result":
+                    continue
+            cleaned.append(msg)
+
+        elif role == "assistant":
+            # Keep only text blocks, drop tool_use blocks
+            if isinstance(content, list):
+                text_blocks = [
+                    b for b in content
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()
+                ]
+                if text_blocks:
+                    cleaned.append({"role": "assistant", "content": text_blocks})
+                # If no text blocks (pure tool call), skip the message
+            else:
+                cleaned.append(msg)
+
+    # Ensure history alternates user/assistant and starts with user
+    if cleaned and cleaned[0]["role"] != "user":
+        cleaned = cleaned[1:]
+
+    return cleaned
 
 
 # -- AI Agent loop -------------------------------------------------------------
@@ -225,9 +272,14 @@ async def run_agent(bot: Bot, chat_id: str, trigger_message: str):
             if "400" in str(e) and (
                 "tool_use_id" in str(e) or "tool_result" in str(e)
             ):
-                logger.warning("Stale conversation history, resetting.")
+                # Strip tool_use/tool_result messages but keep text conversation
+                logger.warning("Stale tool IDs in history, stripping tool messages.")
+                history = _strip_tool_messages(history)
+                history.append({"role": "user", "content": trigger_message})
+                # Rebuild DB from cleaned history
                 db.clear_history(chat_id)
-                history = [{"role": "user", "content": trigger_message}]
+                for msg in history:
+                    db.append_message(chat_id, msg["role"], msg["content"])
                 response = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: _anthropic.messages.create(
@@ -293,14 +345,12 @@ async def run_agent(bot: Bot, chat_id: str, trigger_message: str):
                         label = f"{len(shops)} shops"
                     await bot.send_message(
                         chat_id=chat_id,
-                        text=f"_(Checking {ev_name} availability at {label}...)_",
-                        parse_mode="Markdown",
+                        text=f"Checking {ev_name} availability at {label}...",
                     )
                 else:
                     await bot.send_message(
                         chat_id=chat_id,
-                        text="_(Checking availability...)_",
-                        parse_mode="Markdown",
+                        text="Checking availability...",
                     )
 
             db.log_event(chat_id, "tool_call", tool=tu.name, inputs=tu.input)
