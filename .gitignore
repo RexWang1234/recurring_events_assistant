@@ -5,5 +5,8 @@ __pycache__/
 .DS_Store
 conversation_log.jsonl
 state.json
+calendar_assistant.db
+calendar_assistant.db-wal
+calendar_assistant.db-shm
 scripts/*_page_*.txt
 scripts/*_api_calls.json

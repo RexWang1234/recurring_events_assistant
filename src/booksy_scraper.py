@@ -6,26 +6,23 @@ Intercepts the Booksy internal API:
 
 Schema:
   {"time_slots": [{"date": "YYYY-MM-DD", "slots": [{"t": "HH:MM", "p": ""}, ...]}]}
-
-The time_slots API fires automatically when the page loads with a service pre-selected
-(e.g. via the hash fragment #ba_s=seo which Booksy uses for their embedded widgets).
 """
 
 import asyncio
 import logging
-import re
 from datetime import datetime
 
 from playwright.async_api import async_playwright, Response
 
+from src.models import Slot
+
 logger = logging.getLogger(__name__)
 
-# How many additional weeks to request (Booksy loads 1 week at a time by default)
 EXTRA_WEEKS = 2
 
 
-async def _intercept_time_slots(booking_url: str) -> list[dict]:
-    """Navigate Booksy, click Book next to the service, capture all time_slots responses."""
+async def _intercept_time_slots(booking_url: str, event_name: str) -> list[dict]:
+    """Navigate Booksy, click Book next to the service, capture time_slots responses."""
     captured: list[dict] = []
 
     async with async_playwright() as p:
@@ -46,7 +43,8 @@ async def _intercept_time_slots(booking_url: str) -> list[dict]:
                     if "time_slots" in data:
                         captured.extend(data["time_slots"])
                         logger.info(
-                            f"[booksy] Captured {len(data['time_slots'])} date(s) from {response.url}"
+                            f"[booksy] Captured {len(data['time_slots'])} date(s) "
+                            f"from {response.url}"
                         )
                 except Exception:
                     pass
@@ -57,13 +55,16 @@ async def _intercept_time_slots(booking_url: str) -> list[dict]:
         await page.goto(booking_url, wait_until="domcontentloaded", timeout=20000)
         await page.wait_for_timeout(3000)
 
-        # Click "Book" next to the first (most popular) service to trigger the slot API
-        # Booksy loads time_slots right after service selection
-        for service_hint in ["Men's Hair Cut", "Haircut", "Hair Cut", "Book"]:
+        # Click "Book" next to the matching service
+        service_hints = [event_name, "Men's Hair Cut", "Haircut", "Hair Cut", "Book"]
+        for service_hint in service_hints:
             try:
-                section = page.locator("*").filter(has_text=service_hint).filter(
-                    has=page.get_by_text("Book", exact=False)
-                ).last
+                section = (
+                    page.locator("*")
+                    .filter(has_text=service_hint)
+                    .filter(has=page.get_by_text("Book", exact=False))
+                    .last
+                )
                 book_btn = section.get_by_text("Book", exact=True).last
                 if await book_btn.is_visible(timeout=2000):
                     await book_btn.click()
@@ -77,7 +78,7 @@ async def _intercept_time_slots(booking_url: str) -> list[dict]:
         for _ in range(EXTRA_WEEKS):
             if len(captured) >= 3:
                 break
-            for nav_txt in ["Next week", "Next", "›", ">"]:
+            for nav_txt in ["Next week", "Next", "\u203a", ">"]:
                 try:
                     btn = page.get_by_text(nav_txt, exact=False).first
                     if await btn.is_visible(timeout=1500):
@@ -92,37 +93,23 @@ async def _intercept_time_slots(booking_url: str) -> list[dict]:
     return captured
 
 
-def _parse_time_slots(date_entries: list[dict], preferences: str) -> list[str]:
-    """
-    Convert Booksy time_slot date entries to human-readable slot strings.
+def _entries_to_slots(
+    date_entries: list[dict],
+    event_name: str,
+    shop_name: str,
+    source_url: str,
+) -> list[Slot]:
+    """Convert Booksy time_slot date entries to normalized Slot objects.
 
     Each entry: {"date": "YYYY-MM-DD", "slots": [{"t": "HH:MM", "p": ""}, ...]}
-    Prefers times matching preferences (e.g. "morning", "afternoon", "Saturday").
     """
-    pref_lower = preferences.lower()
-
-    # Day-of-week preference
-    preferred_days: set[int] = set()
-    day_map = {
-        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-        "friday": 4, "saturday": 5, "sunday": 6,
-    }
-    for day_name, day_num in day_map.items():
-        if day_name in pref_lower:
-            preferred_days.add(day_num)
-
-    # Time-of-day preference
-    prefer_morning = "morning" in pref_lower
-    prefer_afternoon = "afternoon" in pref_lower or "pm" in pref_lower
-    prefer_evening = "evening" in pref_lower
-
-    result: list[tuple[datetime, str]] = []
+    slots: list[Slot] = []
     seen: set[str] = set()
 
     for entry in date_entries:
         date_str = entry.get("date", "")
-        slots = entry.get("slots", [])
-        if not date_str or not slots:
+        raw_slots = entry.get("slots", [])
+        if not date_str or not raw_slots:
             continue
 
         try:
@@ -130,12 +117,8 @@ def _parse_time_slots(date_entries: list[dict], preferences: str) -> list[str]:
         except Exception:
             continue
 
-        # Skip non-preferred days if preference is set
-        if preferred_days and date_obj.weekday() not in preferred_days:
-            continue
-
-        for slot in slots:
-            t = slot.get("t", "")
+        for raw in raw_slots:
+            t = raw.get("t", "")
             if not t:
                 continue
             try:
@@ -143,50 +126,43 @@ def _parse_time_slots(date_entries: list[dict], preferences: str) -> list[str]:
                 dt = date_obj.replace(hour=hour, minute=minute)
                 dt_local = dt.astimezone()
 
-                # Apply time-of-day filter if preference set
-                if prefer_morning and hour >= 12:
+                key = dt_local.isoformat()
+                if key in seen:
                     continue
-                if prefer_afternoon and (hour < 12 or hour >= 17):
-                    continue
-                if prefer_evening and hour < 17:
-                    continue
+                seen.add(key)
 
-                label = dt_local.strftime("%a %b %-d – %-I:%M %p")
-                if label not in seen:
-                    seen.add(label)
-                    result.append((dt, label))
+                slots.append(Slot(
+                    shop=shop_name,
+                    service=event_name,
+                    provider=None,
+                    start_time=dt_local,
+                    end_time=None,
+                    duration_min=None,
+                    source_url=source_url,
+                    platform="booksy",
+                ))
             except Exception:
                 continue
 
-    result.sort(key=lambda x: x[0])
-    return [label for _, label in result[:8]]
+    slots.sort(key=lambda s: s.start_time)
+    return slots
 
 
-async def _run(booking_url: str, event_name: str, preferences: str) -> dict:
+def scrape_booksy_slots(
+    booking_url: str,
+    event_name: str = "Haircut",
+    preferences: str = "",
+    shop_name: str = "",
+) -> list[Slot]:
+    """Main entry point -- returns normalized Slot objects."""
     try:
-        date_entries = await _intercept_time_slots(booking_url)
+        date_entries = asyncio.run(
+            _intercept_time_slots(booking_url, event_name)
+        )
         logger.info(f"[booksy] Total date entries captured: {len(date_entries)}")
-
         if not date_entries:
-            return {
-                "slots": [],
-                "message": "Could not load time slots from Booksy.",
-            }
-
-        slots = _parse_time_slots(date_entries, preferences)
-        if not slots:
-            return {
-                "slots": [],
-                "message": "No slots matched your preferences on Booksy.",
-            }
-
-        return {"slots": slots, "message": ""}
-
+            return []
+        return _entries_to_slots(date_entries, event_name, shop_name, booking_url)
     except Exception as e:
         logger.exception("[booksy] Scraper failed")
-        return {"slots": [], "message": f"Error checking Booksy availability: {e}"}
-
-
-def get_available_slots_booksy(booking_url: str, event_name: str, preferences: str) -> dict:
-    """Sync wrapper."""
-    return asyncio.run(_run(booking_url, event_name, preferences))
+        return []

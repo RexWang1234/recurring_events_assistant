@@ -5,8 +5,6 @@ Calendar Assistant
 Commands:
   python main.py run             Start the Telegram bot + daily calendar scheduler
   python main.py status          Show status of all monitored events
-  python main.py check           Check events and send Telegram alerts if due
-  python main.py book <event>    Trigger AI booking agent for a named event (CLI, no Telegram)
 """
 
 import sys
@@ -43,67 +41,18 @@ def cmd_status():
         next_sched = status["next_scheduled"]
 
         print(f"  Event         : {ev['name']}")
+        if ev.get("shop_name"):
+            print(f"  Shop          : {ev['shop_name']}")
         if last:
             print(f"  Last done     : {last.strftime('%Y-%m-%d')}")
             print(f"  Next due      : {next_due.strftime('%Y-%m-%d')} ({days} days away)")
         else:
             print("  No past occurrences found in Apple Calendar.")
         if next_sched:
-            print(f"  Already booked: {next_sched.strftime('%Y-%m-%d')} ✓")
+            print(f"  Already booked: {next_sched.strftime('%Y-%m-%d')}")
         elif days is not None and days <= ev["alert_days_before"]:
-            print(f"  ⚠  Not booked — within alert window ({ev['alert_days_before']}d)")
+            print(f"  !! Not booked -- within alert window ({ev['alert_days_before']}d)")
         print()
-
-
-def cmd_check():
-    """Run a one-off calendar check and send Telegram alerts if anything is due."""
-    import asyncio
-    import os
-    from telegram import Bot
-    from src.telegram_agent import check_calendar_and_alert
-
-    chat_id = os.environ["TELEGRAM_CHAT_ID"]
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-
-    async def _run():
-        bot = Bot(token=token)
-        await check_calendar_and_alert(bot, chat_id)
-
-    asyncio.run(_run())
-    print("Check complete.")
-
-
-def cmd_book(event_name: str):
-    from src.booking_agent import book_appointment
-
-    config = load_config()
-    user_info_path = BASE_DIR / "user_info.yaml"
-    user_info = {}
-    if user_info_path.exists():
-        with open(user_info_path) as f:
-            user_info = yaml.safe_load(f) or {}
-
-    ev = next((e for e in config["events"] if e["name"].lower() == event_name.lower()), None)
-    if ev is None:
-        print(f"Error: No event named '{event_name}' found in config.yaml")
-        print(f"Available events: {[e['name'] for e in config['events']]}")
-        sys.exit(1)
-
-    print(f"\n── Booking: {ev['name']} ────────────────────────────────\n")
-    print(f"  URL         : {ev['booking_url']}")
-    print(f"  Preferences : {ev.get('booking_preferences', '')}")
-    print()
-
-    confirmation = book_appointment(
-        booking_url=ev["booking_url"],
-        event_name=ev["name"],
-        preferences=ev.get("booking_preferences", ""),
-        user_info=user_info,
-    )
-
-    print("\n── Booking result ──────────────────────────────────────\n")
-    print(confirmation)
-    print()
 
 
 def main():
@@ -117,13 +66,6 @@ def main():
         cmd_run()
     elif cmd == "status":
         cmd_status()
-    elif cmd == "check":
-        cmd_check()
-    elif cmd == "book":
-        if len(sys.argv) < 3:
-            print("Usage: python main.py book <event-name>")
-            sys.exit(1)
-        cmd_book(sys.argv[2])
     else:
         print(f"Unknown command: {cmd}")
         print(__doc__)
